@@ -45,7 +45,7 @@ void write_data(const float *const data, const size_t n) {
 
     for (int i = 0; i < n; ++i) {
         for (int j = 0; j < n; ++j) {
-            fprintf(output_file, "%d ", (int) data[i * n + j]);
+            fprintf(output_file, "%0.3f ", data[i * n + j]);
         }
         fprintf(output_file, "\n");
     }
