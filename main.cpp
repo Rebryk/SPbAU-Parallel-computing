@@ -133,7 +133,7 @@ int main() {
         queue.enqueueWriteBuffer(dev_a, CL_TRUE, 0, sizeof(float) * matrix_size_a, a);
         queue.enqueueWriteBuffer(dev_b, CL_TRUE, 0, sizeof(float) * matrix_size_b, b);
 
-        const size_t N = block_size * (n / block_size + 1);
+        const size_t N = block_size * ((n + block_size - 1) / block_size);
         cl::Kernel kernel(program, "matrix_convolution");
         cl::KernelFunctor matrix_convolution(kernel, queue, cl::NullRange, cl::NDRange(N, N),
                                              cl::NDRange(block_size, block_size));
