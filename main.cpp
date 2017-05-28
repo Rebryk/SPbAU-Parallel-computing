@@ -1,4 +1,5 @@
 #define __CL_ENABLE_EXCEPTIONS
+#define SIZE(sz) BLOCK_SIZE * ((sz + BLOCK_SIZE - 1) / BLOCK_SIZE)
 
 #include <iostream>
 #include <vector>
@@ -7,13 +8,15 @@
 
 using namespace std;
 
+const size_t BLOCK_SIZE = 512;
+
 cl::Program::Sources load_sources(const string &file_name) {
     ifstream source_file(file_name);
     string source_string(istreambuf_iterator<char>(source_file), (istreambuf_iterator<char>()));
     return {{source_string.c_str(), source_string.length() + 1}};
 }
 
-void read_data(float *&a, size_t &n, float *&b, size_t &m) {
+void read_data(vector<float> &data) {
     FILE *const input_file = fopen("input.txt", "r");
 
     if (input_file == NULL) {
@@ -21,60 +24,77 @@ void read_data(float *&a, size_t &n, float *&b, size_t &m) {
         return;
     }
 
-    fscanf(input_file, "%d %d\n", &n, &m);
+    int n;
+    fscanf(input_file, "%d\n", &n);
 
-    a = new float[n * n];
+    data.resize((size_t) n);
     for (int i = 0; i < n; ++i) {
-        for (int j = 0; j < n; ++j) {
-            fscanf(input_file, "%f", &a[i * n + j]);
-        }
-    }
-
-    b = new float[m * m];
-    for (int i = 0; i < m; ++i) {
-        for (int j = 0; j < m; ++j) {
-            fscanf(input_file, "%f", &b[i * m + j]);
-        }
+        fscanf(input_file, "%f", &data[i]);
     }
 
     fclose(input_file);
 }
 
-void write_data(const float *const data, const size_t n) {
+void write_data(const vector<float> &data, const size_t limit) {
     FILE *const output_file = fopen("output.txt", "w");
 
-    for (int i = 0; i < n; ++i) {
-        for (int j = 0; j < n; ++j) {
-            fprintf(output_file, "%0.3f ", data[i * n + j]);
-        }
-        fprintf(output_file, "\n");
+    for (int i = 0; i < data.size() && i < limit; ++i) {
+        fprintf(output_file, "%0.3f ", data[i]);
     }
+    fprintf(output_file, "\n");
 
     fflush(output_file);
     fclose(output_file);
 }
 
-void generate_data(const int n, const int m) {
-    FILE *const output_file = fopen("input.txt", "w");
+vector<float> prefix_sum(cl::Context &context,
+                         cl::CommandQueue &queue,
+                         cl::Program &program,
+                         vector<float> &input) {
+    vector<float> output(input.size(), 0);
 
-    fprintf(output_file, "%d %d\n", n, m);
+    cl::Buffer dev_input(context, CL_MEM_READ_ONLY, sizeof(float) * input.size());
+    cl::Buffer dev_output(context, CL_MEM_WRITE_ONLY, sizeof(float) * output.size());
 
-    for (int i = 0; i < n; ++i) {
-        for (int j = 0; j < n; ++j) {
-            fprintf(output_file, "%d ", 1);
+    queue.enqueueWriteBuffer(dev_input, CL_TRUE, 0, sizeof(float) * input.size(), &input[0]);
+
+    cl::Kernel kernel(program, "scan_hillis_steele");
+    cl::KernelFunctor scan_hs(kernel, queue, cl::NullRange, cl::NDRange(input.size()), cl::NDRange(BLOCK_SIZE));
+    cl::Event event = scan_hs(dev_input,
+                              dev_output,
+                              cl::__local(sizeof(float) * BLOCK_SIZE),
+                              cl::__local(sizeof(float) * BLOCK_SIZE));
+
+    event.wait();
+
+    queue.enqueueReadBuffer(dev_output, CL_TRUE, 0, sizeof(float) * output.size(), &output[0]);
+
+    if (output.size() == BLOCK_SIZE) {
+        return output;
+    } else {
+        vector <float> tails(SIZE(output.size() / BLOCK_SIZE), 0);
+        for (int i = 1; i * BLOCK_SIZE - 1 < output.size() && i < tails.size(); ++i) {
+            tails[i] = output[i * BLOCK_SIZE - 1];
         }
-        fprintf(output_file, "\n");
-    }
 
-    for (int i = 0; i < m; ++i) {
-        for (int j = 0; j < m; ++j) {
-            fprintf(output_file, "%d ", 1);
-        }
-        fprintf(output_file, "\n");
-    }
+        vector <float> tails_prefix = prefix_sum(context, queue, program, tails);
 
-    fflush(output_file);
-    fclose(output_file);
+        cl::Buffer dev_input_inc(context, CL_MEM_READ_ONLY, sizeof(float) * tails_prefix.size());
+
+        queue.enqueueWriteBuffer(dev_input, CL_TRUE, 0, sizeof(float) * output.size(), &output[0]);
+        queue.enqueueWriteBuffer(dev_input_inc, CL_TRUE, 0, sizeof(float) * tails_prefix.size(), &tails_prefix[0]);
+
+        cl::Kernel kernel_inc(program, "inc");
+        cl::KernelFunctor inc(kernel_inc, queue, cl::NullRange, cl::NDRange(input.size()), cl::NDRange(BLOCK_SIZE));
+        cl::Event event_inc = inc(dev_input, dev_input_inc, dev_output);
+
+        event_inc.wait();
+
+        vector<float> result(input.size(), 0);
+        queue.enqueueReadBuffer(dev_output, CL_TRUE, 0, sizeof(float) * result.size(), &result[0]);
+
+        return result;
+    }
 }
 
 int main() {
@@ -100,10 +120,10 @@ int main() {
         cl::Context context(devices);
         cl::CommandQueue queue(context, devices.front(), CL_QUEUE_PROFILING_ENABLE);
 
-        cl::Program program(context, load_sources("../kernels/convolution_local.cpp"));
+        cl::Program program(context, load_sources("../scan.cl"));
 
         try {
-            program.build(devices, "-D BLOCK_SIZE=16");
+            program.build(devices, "-D BLOCK_SIZE=512");
         } catch (cl::Error e) {
             size_t len;
             char buffer[2048];
@@ -116,36 +136,15 @@ int main() {
 
         printf("Built program\n");
 
-        float *a, *b;
-        size_t n, m;
-        read_data(a, n, b, m);
-        float c[n * n];
+        vector<float> input;
+        read_data(input);
 
-        const size_t block_size = 16;
-        const size_t matrix_size_a = n * n;
-        const size_t matrix_size_b = m * m;
-        const size_t matrix_size_c = n * n;
+        const size_t n = input.size();
+        input.resize(SIZE(n));
 
-        cl::Buffer dev_a(context, CL_MEM_READ_ONLY, sizeof(float) * matrix_size_a);
-        cl::Buffer dev_b(context, CL_MEM_READ_ONLY, sizeof(float) * matrix_size_b);
-        cl::Buffer dev_c(context, CL_MEM_WRITE_ONLY, sizeof(float) * matrix_size_c);
+        vector <float> output = prefix_sum(context, queue, program, input);
+        write_data(output, n);
 
-        queue.enqueueWriteBuffer(dev_a, CL_TRUE, 0, sizeof(float) * matrix_size_a, a);
-        queue.enqueueWriteBuffer(dev_b, CL_TRUE, 0, sizeof(float) * matrix_size_b, b);
-
-        const size_t N = block_size * ((n + block_size - 1) / block_size);
-        cl::Kernel kernel(program, "matrix_convolution");
-        cl::KernelFunctor matrix_convolution(kernel, queue, cl::NullRange, cl::NDRange(N, N),
-                                             cl::NDRange(block_size, block_size));
-        printf("Created kernel functor\n");
-
-        matrix_convolution(dev_a, dev_b, dev_c, (int) n, (int) m);
-        printf("matrix_convolution completed\n");
-
-        queue.enqueueReadBuffer(dev_c, CL_TRUE, 0, sizeof(float) * matrix_size_c, c);
-        printf("Read buffer\n");
-
-        write_data(c, n);
         printf("Finished\n");
     } catch (cl::Error e) {
         printf("\n%s: %d\n", e.what(), e.err());
